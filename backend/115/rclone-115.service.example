@@ -1,0 +1,30 @@
+# rclone-115 mount as a systemd service (example)
+#
+# 1) sudo cp backend/115/rclone-115.service.example /etc/systemd/system/rclone-115.service
+# 2) edit the paths / remote name below if needed
+# 3) sudo systemctl daemon-reload
+# 4) sudo systemctl enable --now rclone-115
+#
+# Notes:
+# - --allow-other requires `user_allow_other` in /etc/fuse.conf
+# - do NOT use --daemon here, systemd supervises the process
+
+[Unit]
+Description=rclone mount 115 (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=pi
+ExecStart=/usr/local/bin/rclone-115 mount my115: /mnt/115 \
+  --read-only --allow-other \
+  --vfs-read-chunk-size 4M --vfs-read-chunk-streams 2 \
+  --buffer-size 32M --dir-cache-time 1h \
+  --log-level INFO
+ExecStop=/bin/fusermount -u /mnt/115
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

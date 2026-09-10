@@ -1,0 +1,18 @@
+backend: '115'
+name: 115 Cloud
+tier: Tier 3
+maintainers: Unmaintained
+features_score: 1
+integration_tests: None
+data_integrity: Hash
+performance: Medium
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'Test115:'
+features:
+- CanHaveEmptyDirectories
+hashes:
+- sha1
+precision: 1000000000

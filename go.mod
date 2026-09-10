@@ -110,6 +110,8 @@ require (
 	storj.io/uplink v1.14.3
 )
 
+require github.com/SheltonZhu/115driver v1.3.5
+
 require (
 	cloud.google.com/go/auth v0.23.1 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
@@ -122,9 +124,12 @@ require (
 	github.com/ProtonMail/gopenpgp/v3 v3.4.1 // indirect
 	github.com/PuerkitoBio/goquery v1.12.0 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
+	github.com/aead/ecdh v0.2.0 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible // indirect
 	github.com/anacrolix/generics v0.2.0 // indirect
 	github.com/anchore/go-lzo v0.1.1 // indirect
+	github.com/andreburgaud/crypt2go v1.1.0 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/andybalholm/cascadia v1.3.4 // indirect
 	github.com/appscode/go-querystring v0.0.0-20170504095604-0126cfb3f1dc // indirect
@@ -238,6 +243,7 @@ require (
 	github.com/samber/lo v1.53.0 // indirect
 	github.com/shabbyrobe/gocovmerge v0.0.0-20230507112040-c3350d9342df // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e // indirect
 	github.com/smartystreets/goconvey v1.8.1 // indirect
 	github.com/sony/gobreaker/v2 v2.4.0 // indirect
 	github.com/sorairolake/lzip-go v0.3.8 // indirect

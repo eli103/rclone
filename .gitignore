@@ -2,6 +2,7 @@
 _junk/
 rclone
 rclone.exe
+/rclone-115
 build
 /docs/public/
 /docs/.hugo_build.lock
