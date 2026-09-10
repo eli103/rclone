@@ -53,9 +53,11 @@ import (
 const (
 	// rootID is the 115 cid of the root directory.
 	rootID = "0"
-	// defaultMinInterval is the default minimum interval between 115 API calls
-	// (500ms ~= 2 QPS).
-	defaultMinInterval = 500 * time.Millisecond
+	// defaultQPS is the default maximum number of 115 API requests per second.
+	defaultQPS = 2.0
+	// minQPS is the lowest allowed request rate. A configured qps below this
+	// value is clamped up to it so the mount stays usable.
+	minQPS = 1.5
 	// defaultPageSize is the number of entries fetched per listing request.
 	defaultPageSize = int64(1000)
 	// maxPageSize is the largest page size 115 accepts (driver.MaxDirPageLimit).
@@ -101,9 +103,9 @@ func init() {
 			Help:       "KID from the 115 cookie (optional).",
 			IsPassword: true,
 		}, {
-			Name:     "min_interval",
-			Help:     "Minimum interval between 115 API calls.\n\n500ms is about 2 requests per second. Increase this to reduce the chance of tripping 115's rate limiting.",
-			Default:  fs.Duration(defaultMinInterval),
+			Name:     "qps",
+			Help:     "Maximum number of 115 API requests per second.\n\nThe value is clamped to a minimum of 1.5 requests/second; the default is 2.",
+			Default:  defaultQPS,
 			Advanced: true,
 		}, {
 			Name:     "page_size",
@@ -131,7 +133,7 @@ type Options struct {
 	CID           string          `config:"cid"`
 	SEID          string          `config:"seid"`
 	KID           string          `config:"kid"`
-	MinInterval   fs.Duration     `config:"min_interval"`
+	QPS           float64         `config:"qps"`
 	PageSize      int64           `config:"page_size"`
 	ListCacheTime fs.Duration     `config:"list_cache_time"`
 	ListAPIURLs   fs.CommaSepList `config:"list_api_urls"`
@@ -156,6 +158,15 @@ var (
 
 // apiEnter serialises access to the 115 API, enforces the minimum interval and
 // refuses to make calls while a WAF cooldown is active.
+// qpsToInterval converts a requests-per-second setting into the minimum
+// interval between calls, clamping the rate to at least minQPS.
+func qpsToInterval(qps float64) time.Duration {
+	if qps < minQPS {
+		qps = minQPS
+	}
+	return time.Duration(float64(time.Second) / qps)
+}
+
 func apiEnter(ctx context.Context, minInterval time.Duration) error {
 	apiMu.Lock()
 
@@ -220,7 +231,7 @@ func clientFor(opt *Options) (*driver.Pan115Client, error) {
 		return sharedClient.client, nil
 	}
 
-	if err := apiEnter(context.Background(), time.Duration(opt.MinInterval)); err != nil {
+	if err := apiEnter(context.Background(), qpsToInterval(opt.QPS)); err != nil {
 		return nil, err
 	}
 	defer apiExit()
@@ -290,8 +301,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err := configstruct.Set(m, opt); err != nil {
 		return nil, err
 	}
-	if opt.MinInterval == 0 {
-		opt.MinInterval = fs.Duration(defaultMinInterval)
+	if opt.QPS <= 0 {
+		opt.QPS = defaultQPS
+	}
+	if opt.QPS < minQPS {
+		opt.QPS = minQPS
 	}
 	if opt.PageSize <= 0 {
 		opt.PageSize = defaultPageSize
@@ -324,6 +338,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
+
+	fs.Debugf(f, "115: qps=%g (min interval %v), page_size=%d, list_cache_time=%v",
+		opt.QPS, qpsToInterval(opt.QPS), opt.PageSize, time.Duration(opt.ListCacheTime))
 
 	// Resolve the root.  An empty root is the common mount case and costs no
 	// requests at all.
@@ -362,7 +379,7 @@ func (f *Fs) Hashes() hash.Set { return hash.NewHashSet(hash.SHA1) }
 // withAPI runs fn with exclusive access to the 115 API and enforces the
 // configured minimum interval.
 func (f *Fs) withAPI(ctx context.Context, fn func() error) error {
-	if err := apiEnter(ctx, time.Duration(f.opt.MinInterval)); err != nil {
+	if err := apiEnter(ctx, qpsToInterval(f.opt.QPS)); err != nil {
 		return err
 	}
 	defer apiExit()

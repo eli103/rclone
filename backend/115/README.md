@@ -47,14 +47,14 @@ uid = <UID>
 cid = <CID>
 seid = <SEID>
 kid = <KID>
-min_interval = 500ms
+qps = 2
 ```
 
 ### 后端选项
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `min_interval` | `500ms` | 两次 115 API 调用之间的最小间隔（500ms ≈ 2 QPS，调大更保守） |
+| `qps` | `2` | 115 API 每秒最大请求数。**最小为 1.5**：配置低于 1.5 会被强制为 1.5 |
 | `list_cache_time` | `1h` | 路径解析与目录列表的缓存时长（`0` 关闭） |
 | `page_size` | `1000` | 每个列表请求的条数（上限 1150） |
 | `list_api_urls` | 3 个端点 | 目录列表端点，按顺序回落，用于绕开单个端点被 WAF 拦截 |
@@ -95,7 +95,7 @@ rclone-115 mount my115: /mnt/115 --read-only --allow-other \
   rclone-115 config update my115 uid='...' cid='...' seid='...' kid='...'
   ```
 - 走 115 的**私有 API（cookie）**，不是官方 Open API，存在被风控的可能。
-  请勿高频调用，用 `min_interval` 控制 QPS。
+  请勿高频调用，用 `qps` 控制请求速率（已设最小 1.5，防过慢）。
 
 ## 设计说明
 
