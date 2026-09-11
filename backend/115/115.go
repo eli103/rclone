@@ -66,6 +66,9 @@ const (
 	defaultListCacheTime = time.Hour
 	// defaultDownloadCacheTime is how long a signed download URL is reused.
 	defaultDownloadCacheTime = 5 * time.Minute
+	// defaultAPITimeout is the HTTP timeout for 115 API requests.  Without it a
+	// request blocked by the WAF can hang forever and wedge the FUSE mount.
+	defaultAPITimeout = 60 * time.Second
 	// wafCooldown is how long to stop calling the API after a WAF block.
 	wafCooldown = 10 * time.Minute
 )
@@ -110,6 +113,11 @@ func init() {
 			Default:  defaultQPS,
 			Advanced: true,
 		}, {
+			Name:     "api_timeout",
+			Help:     "HTTP timeout for 115 API requests.\n\nWithout a timeout a request blocked by 115's WAF can hang forever and wedge the mount.",
+			Default:  fs.Duration(defaultAPITimeout),
+			Advanced: true,
+		}, {
 			Name:     "page_size",
 			Help:     "Number of entries requested per directory listing call.\n\nLarger values mean fewer requests for big directories.",
 			Default:  defaultPageSize,
@@ -141,6 +149,7 @@ type Options struct {
 	SEID              string          `config:"seid"`
 	KID               string          `config:"kid"`
 	QPS               float64         `config:"qps"`
+	APITimeout        fs.Duration     `config:"api_timeout"`
 	PageSize          int64           `config:"page_size"`
 	ListCacheTime     fs.Duration     `config:"list_cache_time"`
 	DownloadCacheTime fs.Duration     `config:"download_cache_time"`
@@ -245,6 +254,8 @@ func clientFor(opt *Options) (*driver.Pan115Client, error) {
 	defer apiExit()
 
 	c := driver.Default()
+	// Bound every 115 API request so a WAF block cannot hang the mount forever.
+	c.Client.SetTimeout(time.Duration(opt.APITimeout))
 	c.ImportCredential(&driver.Credential{
 		UID:  opt.UID,
 		CID:  opt.CID,
@@ -357,6 +368,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.QPS < minQPS {
 		opt.QPS = minQPS
 	}
+	if opt.APITimeout == 0 {
+		opt.APITimeout = fs.Duration(defaultAPITimeout)
+	}
 	if opt.PageSize <= 0 {
 		opt.PageSize = defaultPageSize
 	}
@@ -392,8 +406,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 
-	fs.Debugf(f, "115: qps=%g (min interval %v), page_size=%d, list_cache_time=%v, download_cache_time=%v",
-		opt.QPS, qpsToInterval(opt.QPS), opt.PageSize, time.Duration(opt.ListCacheTime), time.Duration(opt.DownloadCacheTime))
+	fs.Debugf(f, "115: qps=%g (min interval %v), api_timeout=%v, page_size=%d, list_cache_time=%v, download_cache_time=%v",
+		opt.QPS, qpsToInterval(opt.QPS), time.Duration(opt.APITimeout), opt.PageSize, time.Duration(opt.ListCacheTime), time.Duration(opt.DownloadCacheTime))
 
 	// Resolve the root.  An empty root is the common mount case and costs no
 	// requests at all.
