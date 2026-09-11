@@ -64,6 +64,8 @@ const (
 	maxPageSize = int64(1150)
 	// defaultListCacheTime is how long path/cid and listing caches live.
 	defaultListCacheTime = time.Hour
+	// defaultDownloadCacheTime is how long a signed download URL is reused.
+	defaultDownloadCacheTime = 5 * time.Minute
 	// wafCooldown is how long to stop calling the API after a WAF block.
 	wafCooldown = 10 * time.Minute
 )
@@ -118,6 +120,11 @@ func init() {
 			Default:  fs.Duration(defaultListCacheTime),
 			Advanced: true,
 		}, {
+			Name:     "download_cache_time",
+			Help:     "How long to reuse a signed download URL for the same file.\n\n115 download URLs stay valid for a while, so re-opening the same file shortly after (a second read stream, a retry, a rescan) reuses the URL instead of asking the API for a new one. Set to 0 to disable.",
+			Default:  fs.Duration(defaultDownloadCacheTime),
+			Advanced: true,
+		}, {
 			Name:     "list_api_urls",
 			Help:     "Endpoints used for directory listings, tried in order until one succeeds.",
 			Default:  defaultListAPIURLs,
@@ -129,14 +136,15 @@ func init() {
 
 // Options defines the configuration for this backend.
 type Options struct {
-	UID           string          `config:"uid"`
-	CID           string          `config:"cid"`
-	SEID          string          `config:"seid"`
-	KID           string          `config:"kid"`
-	QPS           float64         `config:"qps"`
-	PageSize      int64           `config:"page_size"`
-	ListCacheTime fs.Duration     `config:"list_cache_time"`
-	ListAPIURLs   fs.CommaSepList `config:"list_api_urls"`
+	UID               string          `config:"uid"`
+	CID               string          `config:"cid"`
+	SEID              string          `config:"seid"`
+	KID               string          `config:"kid"`
+	QPS               float64         `config:"qps"`
+	PageSize          int64           `config:"page_size"`
+	ListCacheTime     fs.Duration     `config:"list_cache_time"`
+	DownloadCacheTime fs.Duration     `config:"download_cache_time"`
+	ListAPIURLs       fs.CommaSepList `config:"list_api_urls"`
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +278,48 @@ var gcache = struct {
 	paths: map[string]string{},
 }
 
+// downloadInfoCacheEntry is a cached signed download URL for one file.
+type downloadInfoCacheEntry struct {
+	info *driver.DownloadInfo
+	ua   string
+	time time.Time
+}
+
+// dlCache caches signed download URLs by pickcode. 115 download URLs stay
+// valid for a while, so re-opening the same file soon after (a second read
+// stream, a retry, a media scanner probing the same file) reuses the URL
+// instead of asking the API for a new one. This keeps the number of requests
+// to 115's download-URL endpoint down, which is the endpoint its WAF limits.
+var dlCache = struct {
+	mu    sync.Mutex
+	items map[string]*downloadInfoCacheEntry
+}{items: map[string]*downloadInfoCacheEntry{}}
+
+func dlCacheGet(pickCode, ua string, ttl time.Duration) *driver.DownloadInfo {
+	if ttl <= 0 {
+		return nil
+	}
+	dlCache.mu.Lock()
+	defer dlCache.mu.Unlock()
+	e, ok := dlCache.items[pickCode]
+	if !ok || e.ua != ua || time.Since(e.time) >= ttl {
+		return nil
+	}
+	return e.info
+}
+
+func dlCachePut(pickCode, ua string, info *driver.DownloadInfo) {
+	dlCache.mu.Lock()
+	dlCache.items[pickCode] = &downloadInfoCacheEntry{info: info, ua: ua, time: time.Now()}
+	dlCache.mu.Unlock()
+}
+
+func dlCacheDel(pickCode string) {
+	dlCache.mu.Lock()
+	delete(dlCache.items, pickCode)
+	dlCache.mu.Unlock()
+}
+
 // ---------------------------------------------------------------------------
 // Fs
 // ---------------------------------------------------------------------------
@@ -316,6 +366,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.ListCacheTime == 0 {
 		opt.ListCacheTime = fs.Duration(defaultListCacheTime)
 	}
+	if opt.DownloadCacheTime == 0 {
+		opt.DownloadCacheTime = fs.Duration(defaultDownloadCacheTime)
+	}
 	if len(opt.ListAPIURLs) == 0 {
 		opt.ListAPIURLs = defaultListAPIURLs
 	}
@@ -339,8 +392,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 
-	fs.Debugf(f, "115: qps=%g (min interval %v), page_size=%d, list_cache_time=%v",
-		opt.QPS, qpsToInterval(opt.QPS), opt.PageSize, time.Duration(opt.ListCacheTime))
+	fs.Debugf(f, "115: qps=%g (min interval %v), page_size=%d, list_cache_time=%v, download_cache_time=%v",
+		opt.QPS, qpsToInterval(opt.QPS), opt.PageSize, time.Duration(opt.ListCacheTime), time.Duration(opt.DownloadCacheTime))
 
 	// Resolve the root.  An empty root is the common mount case and costs no
 	// requests at all.
@@ -719,8 +772,55 @@ func (o *Object) Storable() bool { return true }
 // exact User-Agent that will later fetch it (rclone's own User-Agent, which
 // rclone's fshttp transport forces onto every request).  This mirrors what
 // OpenList does in drivers/115/driver.go Link().
+//
+// Signed URLs are cached for download_cache_time so that repeated opens of the
+// same file (a second read stream, a retry, a scanner probing it) do not each
+// cost a request to 115's download-URL endpoint.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	ua := fs.GetConfig(ctx).UserAgent
+	ttl := time.Duration(o.fs.opt.DownloadCacheTime)
+
+	info := dlCacheGet(o.pickCode, ua, ttl)
+	fromCache := info != nil
+	if fromCache {
+		fs.Debugf(o, "reusing cached download URL")
+	}
+
+	// Two attempts: the first may use a cached (possibly stale) URL; if the CDN
+	// rejects it we drop the cache entry and sign a fresh URL.
+	for attempt := 0; attempt < 2; attempt++ {
+		if info == nil {
+			var err error
+			info, err = o.fetchDownloadURL(ctx, ua)
+			if err != nil {
+				return nil, err
+			}
+			if ttl > 0 {
+				dlCachePut(o.pickCode, ua, info)
+			}
+		}
+
+		res, err := o.download(ctx, info, options...)
+		if err == nil {
+			return res, nil
+		}
+
+		var httpErr *downloadHTTPError
+		if fromCache && errors.As(err, &httpErr) &&
+			(httpErr.status == http.StatusForbidden || httpErr.status == http.StatusNotFound) {
+			fs.Debugf(o, "cached download URL rejected (%d), refreshing", httpErr.status)
+			dlCacheDel(o.pickCode)
+			info = nil
+			fromCache = false
+			continue
+		}
+		return nil, err
+	}
+	return nil, errors.New("115: download failed after refreshing URL")
+}
+
+// fetchDownloadURL asks the API for a signed, User-Agent bound download URL.
+func (o *Object) fetchDownloadURL(ctx context.Context, ua string) (*driver.DownloadInfo, error) {
 	var info *driver.DownloadInfo
 	err := o.fs.withAPI(ctx, func() error {
 		var e error
@@ -736,7 +836,24 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if info == nil || info.Url.Url == "" {
 		return nil, errors.New("115: empty download URL")
 	}
+	return info, nil
+}
 
+// downloadHTTPError is a non-2xx response from the 115 CDN.
+type downloadHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *downloadHTTPError) Error() string {
+	if e.body == "" {
+		return fmt.Sprintf("115: download failed: HTTP %d", e.status)
+	}
+	return fmt.Sprintf("115: download failed: HTTP %d: %s", e.status, e.body)
+}
+
+// download performs the CDN GET using a signed download URL.
+func (o *Object) download(ctx context.Context, info *driver.DownloadInfo, options ...fs.OpenOption) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, info.Url.Url, nil)
 	if err != nil {
 		return nil, err
@@ -753,7 +870,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		req.Header.Set(k, v)
 	}
 	// Do NOT override the User-Agent: the URL was signed with rclone's
-	// User-Agent and fshttp will force exactly that onto the wire.  Setting a
+	// User-Agent and fshttp will force exactly that onto the wire. Setting a
 	// different one (or none) makes 115's CDN reject the signature.
 
 	res, err := o.fs.httpClient.Do(req)
@@ -763,7 +880,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
 		_ = res.Body.Close()
-		return nil, fmt.Errorf("115: download failed: %s: %s", res.Status, strings.TrimSpace(string(body)))
+		return nil, &downloadHTTPError{status: res.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	return res.Body, nil
 }
