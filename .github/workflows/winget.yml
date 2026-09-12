@@ -8,6 +8,11 @@ permissions:
 
 jobs:
   publish:
+    # Only the upstream repository can publish to Winget: it owns the
+    # Rclone.Rclone package and holds the WINGET_TOKEN secret.  Without this
+    # guard every release published from a fork (for example by
+    # build-packages.yml) leaves a failed run behind.
+    if: github.repository == 'rclone/rclone'
     runs-on: ubuntu-latest
     steps:
       - uses: vedantmgoyal2009/winget-releaser@v2
