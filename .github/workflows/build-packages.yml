@@ -14,9 +14,20 @@
 # Trigger it by hand from the Actions tab for artifacts, or push a v* tag to
 # also get a GitHub Release with the same files attached.
 #
-# All targets are built with CGO_ENABLED=0.  That keeps the binaries pure Go
-# and portable, at the cost of the cgo/cmount mount implementations: use these
-# builds for copy/sync/mount-via-bazil-fuse, not Windows WinFsp mounting.
+# All targets are built with CGO_ENABLED=0, which keeps the binaries pure Go and
+# portable.  What that means for mounting:
+#
+#   linux    rclone mount and rclone mount2, no build tag needed (bazil.org/fuse
+#            and github.com/hanwen/go-fuse are both pure Go).
+#   windows  rclone mount comes from cmount/cgofuse, so windows-amd64 is built
+#            with -tags cmount.  cgofuse has a pure Go Windows backend, so
+#            CGO_ENABLED=0 is enough - no MinGW toolchain and no WinFsp SDK are
+#            needed for the build.  WinFsp itself is a kernel driver that rclone
+#            loads from the user's machine at run time, so users still have to
+#            install it.  See docs/content/commands/rclone_mount.md.
+#   darwin   cmount is gated on `darwin && cgo`, so -tags cmount alone does
+#            nothing with CGO_ENABLED=0.  A mounting build for macOS needs a
+#            macos runner plus macFUSE, which is why it is not done here.
 
 name: build-packages
 
@@ -36,6 +47,9 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +59,7 @@ jobs:
           - {name: linux-armv7,   goos: linux,   goarch: arm,   goarm: '7', ext: ''}
           - {name: darwin-amd64,  goos: darwin,  goarch: amd64, ext: ''}
           - {name: darwin-arm64,  goos: darwin,  goarch: arm64, ext: ''}
-          - {name: windows-amd64, goos: windows, goarch: amd64, ext: '.exe'}
+          - {name: windows-amd64, goos: windows, goarch: amd64, gotags: cmount, ext: '.exe'}
 
     steps:
       - name: Checkout
@@ -81,6 +95,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
+          GOTAGS: ${{ matrix.gotags }}
           EXT: ${{ matrix.ext }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -99,7 +114,14 @@ jobs:
               go run bin/resource_windows.go -version "${VERSION}" -arch "${GOARCH}" \
                 -syso "resource_windows_${GOARCH}.syso"
           fi
-          go build -v \
+          # Only windows-amd64 sets GOTAGS (see the matrix).  Keep it as an
+          # array so that a target without tags does not get a stray empty
+          # -tags argument.
+          tags=()
+          if [[ -n "${GOTAGS}" ]]; then
+            tags=(-tags "${GOTAGS}")
+          fi
+          go build -v "${tags[@]}" \
             -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
             -o "rclone${EXT}" .
           rm -f resource_windows_*.syso
@@ -108,6 +130,24 @@ jobs:
         run: |
           ./rclone${{ matrix.ext }} version
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+
+      - name: Check that mount support really made it in
+        env:
+          NAME: ${{ matrix.name }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          # On Windows `rclone mount` is only registered by cmount, which is
+          # only compiled in with -tags cmount.  Without it the command is
+          # silently absent, so assert on the linked dependencies rather than
+          # shipping a build nobody can mount with.  go version -m reads the
+          # build settings out of a binary for any platform.
+          if [[ "${NAME}" == "windows-amd64" ]]; then
+            if ! go version -m "rclone${EXT}" | grep -q 'winfsp/cgofuse'; then
+              echo "::error::cgofuse is not linked, so this build has no 'rclone mount'"
+              exit 1
+            fi
+            go version -m "rclone${EXT}" | grep -E '^\s+build\s+-tags=' || true
+          fi
 
       - name: Package
         env:
