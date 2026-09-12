@@ -14,20 +14,23 @@
 # Trigger it by hand from the Actions tab for artifacts, or push a v* tag to
 # also get a GitHub Release with the same files attached.
 #
-# All targets are built with CGO_ENABLED=0, which keeps the binaries pure Go and
-# portable.  What that means for mounting:
+# Every target is built with the pure Go FUSE implementations where it can be,
+# which is what decides whether `rclone mount` exists in the binary:
 #
-#   linux    rclone mount and rclone mount2, no build tag needed (bazil.org/fuse
-#            and github.com/hanwen/go-fuse are both pure Go).
+#   linux    rclone mount and rclone mount2 with no build tag and no cgo
+#            (bazil.org/fuse and github.com/hanwen/go-fuse are both pure Go).
 #   windows  rclone mount comes from cmount/cgofuse, so windows-amd64 is built
 #            with -tags cmount.  cgofuse has a pure Go Windows backend, so
-#            CGO_ENABLED=0 is enough - no MinGW toolchain and no WinFsp SDK are
-#            needed for the build.  WinFsp itself is a kernel driver that rclone
-#            loads from the user's machine at run time, so users still have to
-#            install it.  See docs/content/commands/rclone_mount.md.
-#   darwin   cmount is gated on `darwin && cgo`, so -tags cmount alone does
-#            nothing with CGO_ENABLED=0.  A mounting build for macOS needs a
-#            macos runner plus macFUSE, which is why it is not done here.
+#            CGO_ENABLED=0 is enough - no MinGW toolchain and no WinFsp SDK.
+#            WinFsp is a kernel driver that rclone loads from the user's machine
+#            at run time, so users still have to install it themselves.
+#   darwin   cmount is gated on `cmount && darwin && cgo`, so macOS needs a
+#            macOS runner, CGO_ENABLED=1 and the macFUSE headers, plus the tag.
+#            macos-latest is arm64, so darwin-amd64 is also a cross build with
+#            -arch x86_64.  cgofuse dlopens libfuse at run time rather than
+#            linking it, so nothing is linked against macFUSE here and users
+#            still have to install it to mount.  See
+#            docs/content/commands/rclone_mount.md.
 
 name: build-packages
 
@@ -45,8 +48,8 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -54,12 +57,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: linux-amd64,   goos: linux,   goarch: amd64, ext: ''}
-          - {name: linux-arm64,   goos: linux,   goarch: arm64, ext: ''}
-          - {name: linux-armv7,   goos: linux,   goarch: arm,   goarm: '7', ext: ''}
-          - {name: darwin-amd64,  goos: darwin,  goarch: amd64, ext: ''}
-          - {name: darwin-arm64,  goos: darwin,  goarch: arm64, ext: ''}
-          - {name: windows-amd64, goos: windows, goarch: amd64, gotags: cmount, ext: '.exe'}
+          # Pure Go, CGO_ENABLED=0.
+          - {name: linux-amd64,   os: ubuntu-latest, goos: linux,   goarch: amd64, ext: ''}
+          - {name: linux-arm64,   os: ubuntu-latest, goos: linux,   goarch: arm64, ext: ''}
+          - {name: linux-armv7,   os: ubuntu-latest, goos: linux,   goarch: arm,   goarm: '7', ext: ''}
+          # cgofuse has a pure Go Windows backend, so only the tag is needed.
+          - {name: windows-amd64, os: ubuntu-latest, goos: windows, goarch: amd64, gotags: cmount, ext: '.exe'}
+          # cgo, on a macOS runner: cmount on darwin requires it.
+          - {name: darwin-amd64,  os: macos-latest,  goos: darwin,  goarch: amd64, cgo: '1', carch: x86_64, gotags: cmount, ext: ''}
+          - {name: darwin-arm64,  os: macos-latest,  goos: darwin,  goarch: arm64, cgo: '1', carch: arm64,  gotags: cmount, ext: ''}
 
     steps:
       - name: Checkout
@@ -74,6 +80,32 @@ jobs:
         with:
           # go.mod is the single source of truth for the Go version.
           go-version-file: go.mod
+
+      - name: Install macFUSE
+        if: matrix.goos == 'darwin'
+        run: |
+          # cmount compiles against the FUSE headers on macOS.  Only the headers
+          # are needed to build: cgofuse dlopens libfuse at run time and the
+          # kernel extension is only used on the machine that mounts something.
+          unset HOMEBREW_NO_INSTALL_FROM_API
+          brew untap --force homebrew/core || true
+          brew untap --force homebrew/cask || true
+          brew update
+          brew install --cask macfuse
+          echo "runner arch: $(uname -m)"
+          # Fail here with a readable message rather than deep inside the
+          # compiler if the headers did not land where the cgofuse #cgo CFLAGS
+          # look for them (-I/usr/local/include/fuse and
+          # -I/usr/local/include/osxfuse/fuse).
+          for header in /usr/local/include/fuse/fuse.h /usr/local/include/osxfuse/fuse/fuse.h; do
+            if [[ -f "${header}" ]]; then
+              echo "macFUSE headers: ${header}"
+              exit 0
+            fi
+          done
+          echo "::error::no macFUSE headers found"
+          find /usr/local/include -name 'fuse.h' 2>/dev/null | head
+          exit 1
 
       - name: Work out the version string
         id: version
@@ -91,11 +123,14 @@ jobs:
 
       - name: Build
         env:
-          CGO_ENABLED: '0'
+          # windows-amd64 uses cgofuse's pure Go backend, so it stays at 0;
+          # darwin needs real cgo for cmount (see the matrix).
+          CGO_ENABLED: ${{ matrix.cgo || '0' }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
           GOTAGS: ${{ matrix.gotags }}
+          CARCH: ${{ matrix.carch }}
           EXT: ${{ matrix.ext }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -114,9 +149,16 @@ jobs:
               go run bin/resource_windows.go -version "${VERSION}" -arch "${GOARCH}" \
                 -syso "resource_windows_${GOARCH}.syso"
           fi
-          # Only windows-amd64 sets GOTAGS (see the matrix).  Keep it as an
-          # array so that a target without tags does not get a stray empty
-          # -tags argument.
+          # macOS: tell clang which slice to emit.  macos-latest is arm64, so
+          # darwin-amd64 is a cross build even though the host is macOS.
+          # /usr/local is where macFUSE installs its headers, which is what the
+          # cgofuse #cgo CFLAGS expect and what upstream passes too.
+          if [[ -n "${CARCH}" ]]; then
+            export CGO_CFLAGS="-I/usr/local/include -arch ${CARCH}"
+            export CGO_LDFLAGS="-L/usr/local/lib -arch ${CARCH}"
+          fi
+          # Keep the tags as an array so a target without tags does not get a
+          # stray empty -tags argument.
           tags=()
           if [[ -n "${GOTAGS}" ]]; then
             tags=(-tags "${GOTAGS}")
@@ -129,24 +171,29 @@ jobs:
       - name: Smoke test the binary
         run: |
           ./rclone${{ matrix.ext }} version
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        # Native runners only: linux-amd64 on ubuntu, darwin-arm64 on the arm64
+        # macOS runner.  The others are cross builds and cannot be executed.
+        if: matrix.name == 'linux-amd64' || matrix.name == 'darwin-arm64'
 
       - name: Check that mount support really made it in
         env:
           NAME: ${{ matrix.name }}
           EXT: ${{ matrix.ext }}
+          GOTAGS: ${{ matrix.gotags }}
         run: |
-          # On Windows `rclone mount` is only registered by cmount, which is
-          # only compiled in with -tags cmount.  Without it the command is
-          # silently absent, so assert on the linked dependencies rather than
-          # shipping a build nobody can mount with.  go version -m reads the
-          # build settings out of a binary for any platform.
-          if [[ "${NAME}" == "windows-amd64" ]]; then
+          # `rclone mount` comes from cmount/cgofuse on Windows and macOS.
+          # cmount also builds to an empty stub when its constraints are not
+          # met, so the build can succeed while shipping no mount command at
+          # all.  Assert on the linked dependency instead of trusting that the
+          # tag did something: go version -m reads the build settings out of a
+          # binary for any platform, and cgofuse is a cgo package so it can
+          # only be linked when the real implementation was compiled.
+          if [[ "${GOTAGS}" == *cmount* ]]; then
             if ! go version -m "rclone${EXT}" | grep -q 'winfsp/cgofuse'; then
               echo "::error::cgofuse is not linked, so this build has no 'rclone mount'"
               exit 1
             fi
-            go version -m "rclone${EXT}" | grep -E '^\s+build\s+-tags=' || true
+            go version -m "rclone${EXT}" | grep -E '^\s+build\s+(-tags=|CGO_ENABLED=)'
           fi
 
       - name: Package
