@@ -88,9 +88,16 @@ jobs:
           # executable via a resource .syso.  go build picks up
           # resource_windows_<GOARCH>.syso automatically, so it has to live in
           # the package directory (the repository root) and be cleaned up after.
+          #
+          # GOOS/GOARCH above are for the cross-compile, but this generator has
+          # to run on the runner itself.  Drop them for this one command, or
+          # go run builds a Windows executable and then cannot start it on the
+          # Linux runner ("exec format error").  The target architecture is
+          # passed explicitly with -arch instead.
           if [[ "${GOOS}" == "windows" ]]; then
-            go run bin/resource_windows.go -version "${VERSION}" -arch "${GOARCH}" \
-              -syso "resource_windows_${GOARCH}.syso"
+            env -u GOOS -u GOARCH -u GOARM \
+              go run bin/resource_windows.go -version "${VERSION}" -arch "${GOARCH}" \
+                -syso "resource_windows_${GOARCH}.syso"
           fi
           go build -v \
             -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
