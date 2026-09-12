@@ -1,0 +1,158 @@
+---
+# Github Actions build of downloadable rclone packages for this fork.
+# -*- compile-command: "yamllint -f parsable build-packages.yml" -*-
+#
+# Why this exists: the upstream .github/workflows/build.yml is test-only on a
+# fork.  Its "Deploy built binaries" step is gated on
+# `github.repository == 'rclone/rclone'`, and none of its steps call
+# actions/upload-artifact, so on a fork it can never produce anything you can
+# download.  This workflow only builds and publishes packages.
+#
+# Version string: a tag push such as v1.76.0-115 is used verbatim, otherwise
+# the fork gets an upstream style beta string, e.g. v1.76.0-beta.1234.d8af2b20.
+#
+# Trigger it by hand from the Actions tab for artifacts, or push a v* tag to
+# also get a GitHub Release with the same files attached.
+#
+# All targets are built with CGO_ENABLED=0.  That keeps the binaries pure Go
+# and portable, at the cost of the cgo/cmount mount implementations: use these
+# builds for copy/sync/mount-via-bazil-fuse, not Windows WinFsp mounting.
+
+name: build-packages
+
+on:
+  # Manual run from the Actions tab: artifacts only, no release.
+  workflow_dispatch:
+  # Tag push, e.g. v1.76.0-115: artifacts plus a GitHub Release.
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: linux-amd64,   goos: linux,   goarch: amd64, ext: ''}
+          - {name: linux-arm64,   goos: linux,   goarch: arm64, ext: ''}
+          - {name: linux-armv7,   goos: linux,   goarch: arm,   goarm: '7', ext: ''}
+          - {name: darwin-amd64,  goos: darwin,  goarch: amd64, ext: ''}
+          - {name: darwin-arm64,  goos: darwin,  goarch: arm64, ext: ''}
+          - {name: windows-amd64, goos: windows, goarch: amd64, ext: '.exe'}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history so the beta version string can count commits and
+          # resolve the short hash.
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          # go.mod is the single source of truth for the Go version.
+          go-version-file: go.mod
+
+      - name: Work out the version string
+        id: version
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="$(cat VERSION)-beta.$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Building ${version} for ${GOOS}/${GOARCH}"
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          EXT: ${{ matrix.ext }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # An icon and version metadata are embedded in the Windows
+          # executable via a resource .syso.  go build picks up
+          # resource_windows_<GOARCH>.syso automatically, so it has to live in
+          # the package directory (the repository root) and be cleaned up after.
+          if [[ "${GOOS}" == "windows" ]]; then
+            go run bin/resource_windows.go -version "${VERSION}" -arch "${GOARCH}" \
+              -syso "resource_windows_${GOARCH}.syso"
+          fi
+          go build -v \
+            -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${VERSION}" \
+            -o "rclone${EXT}" .
+          rm -f resource_windows_*.syso
+
+      - name: Smoke test the binary
+        run: |
+          ./rclone${{ matrix.ext }} version
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+
+      - name: Package
+        env:
+          EXT: ${{ matrix.ext }}
+          NAME: ${{ matrix.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dir="rclone-${VERSION}-${NAME}"
+          mkdir -p "dist/${dir}"
+          mv "rclone${EXT}" "dist/${dir}/"
+          # Ship the docs alongside the binary, as the upstream release zips do.
+          cp README.md MANUAL.md MANUAL.txt rclone.1 "dist/${dir}/"
+          (cd dist && zip -r "../${dir}.zip" "${dir}")
+          ls -l "${dir}.zip"
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: rclone-*-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish the GitHub Release
+    needs: build
+    # Only a tag push publishes a release; manual runs just keep the artifacts.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create the release and upload its assets.
+      contents: write
+
+    steps:
+      - name: Collect the packages
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ./*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          # The automatically provided workflow token; no extra secret needed.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.zip dist/SHA256SUMS
