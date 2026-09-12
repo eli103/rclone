@@ -45,6 +45,16 @@ on:
 permissions:
   contents: read
 
+# A tag push is occasionally delivered twice by GitHub (seen with
+# v1.76.0-115.2: two runs a second apart, and the second one failed because the
+# first had already created the release), and re-running a job keeps the same
+# ref.  Serialise per ref and let the newer run win so a duplicate does not
+# build everything a second time.  The release step is idempotent as well, so
+# whichever run gets there last still leaves a complete release behind.
+concurrency:
+  group: build-packages-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -240,13 +250,26 @@ jobs:
           sha256sum ./*.zip > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create the release
+      - name: Create or update the release
         env:
           # The automatically provided workflow token; no extra secret needed.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            dist/*.zip dist/SHA256SUMS
+          # Idempotent on purpose: `gh release create` exits 422
+          # "already_exists" when the tag already has a release, which happens
+          # for a duplicated push event and for any re-run of a failed job.
+          # Update the assets instead of failing in those cases.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "${TAG} already has a release; refreshing its assets"
+            gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+              dist/*.zip dist/SHA256SUMS
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" \
+              --generate-notes \
+              dist/*.zip dist/SHA256SUMS
+          fi
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease,assets
