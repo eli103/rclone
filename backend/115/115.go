@@ -69,8 +69,17 @@ const (
 	// defaultAPITimeout is the HTTP timeout for 115 API requests.  Without it a
 	// request blocked by the WAF can hang forever and wedge the FUSE mount.
 	defaultAPITimeout = 60 * time.Second
-	// wafCooldown is how long to stop calling the API after a WAF block.
-	wafCooldown = 10 * time.Minute
+	// defaultWAFCooldown is how long to stop calling the API after the first
+	// WAF block.  115's WAF blocks are usually short - an observed one cleared
+	// in about three minutes - so this starts small and escalates, instead of
+	// keeping the mount down for a fixed ten minutes after a brief blip.
+	defaultWAFCooldown = time.Minute
+	// defaultWAFCooldownMax caps that escalation, so a sustained block still
+	// backs off to something more conservative than any fixed value.
+	defaultWAFCooldownMax = 30 * time.Minute
+	// wafCooldownFactor is how much each consecutive WAF block extends the next
+	// cooldown.
+	wafCooldownFactor = 2
 )
 
 var errorReadOnly = errors.New("115 backend is read only")
@@ -118,6 +127,16 @@ func init() {
 			Default:  fs.Duration(defaultAPITimeout),
 			Advanced: true,
 		}, {
+			Name:     "waf_cooldown",
+			Help:     "How long to stop calling the 115 API after the first WAF block.\n\nEach consecutive block doubles the next cooldown, up to waf_cooldown_max, and any successful API call resets it back to this value. 115's WAF blocks are usually brief, so a short base recovers quickly without hammering the API during a sustained block.",
+			Default:  fs.Duration(defaultWAFCooldown),
+			Advanced: true,
+		}, {
+			Name:     "waf_cooldown_max",
+			Help:     "Upper bound for the escalating WAF cooldown.",
+			Default:  fs.Duration(defaultWAFCooldownMax),
+			Advanced: true,
+		}, {
 			Name:     "page_size",
 			Help:     "Number of entries requested per directory listing call.\n\nLarger values mean fewer requests for big directories.",
 			Default:  defaultPageSize,
@@ -150,6 +169,8 @@ type Options struct {
 	KID               string          `config:"kid"`
 	QPS               float64         `config:"qps"`
 	APITimeout        fs.Duration     `config:"api_timeout"`
+	WAFCooldown       fs.Duration     `config:"waf_cooldown"`
+	WAFCooldownMax    fs.Duration     `config:"waf_cooldown_max"`
 	PageSize          int64           `config:"page_size"`
 	ListCacheTime     fs.Duration     `config:"list_cache_time"`
 	DownloadCacheTime fs.Duration     `config:"download_cache_time"`
@@ -168,9 +189,18 @@ var (
 	// minimum interval.
 	apiLast time.Time
 
-	// wafMu guards wafUntil.
+	// wafMu guards the fields below.
+	//
+	// wafUntil is the process wide cooldown, used when a call that is not tied
+	// to one listing endpoint is blocked, or when every listing endpoint is.
+	// wafNext is the length of the next cooldown: it doubles on each
+	// consecutive block and any successful API call resets it.
+	// wafURLs holds per-endpoint cooldowns, so one blocked listing endpoint
+	// does not take the whole mount down while the others still work.
 	wafMu    sync.Mutex
 	wafUntil time.Time
+	wafNext  time.Duration
+	wafURLs  = map[string]time.Time{}
 )
 
 // apiEnter serialises access to the 115 API, enforces the minimum interval and
@@ -211,9 +241,70 @@ func apiEnter(ctx context.Context, minInterval time.Duration) error {
 
 func apiExit() { apiMu.Unlock() }
 
-func markWAFBlocked() {
+// wafCooldownStep returns the length to use for the next cooldown and records
+// the doubled length for the one after it. base is the configured first
+// cooldown and max its upper bound. The caller must hold wafMu.
+func wafCooldownStep(base, max time.Duration) time.Duration {
+	if base <= 0 {
+		base = defaultWAFCooldown
+	}
+	if max < base {
+		max = base
+	}
+	if wafNext <= 0 {
+		wafNext = base
+	}
+	d := wafNext
+	wafNext *= wafCooldownFactor
+	if wafNext > max {
+		wafNext = max
+	}
+	return d
+}
+
+// markWAFBlocked starts the process wide cooldown after a block that is not
+// specific to one listing endpoint, escalating the length on each consecutive
+// block. It returns the cooldown it applied.
+func markWAFBlocked(base, max time.Duration) time.Duration {
 	wafMu.Lock()
-	wafUntil = time.Now().Add(wafCooldown)
+	defer wafMu.Unlock()
+	d := wafCooldownStep(base, max)
+	wafUntil = time.Now().Add(d)
+	return d
+}
+
+// markURLBlocked parks a single listing endpoint. The other endpoints are
+// unaffected, so a WAF rule that only covers one of them no longer stops the
+// mount from listing. It returns the cooldown it applied.
+func markURLBlocked(url string, base, max time.Duration) time.Duration {
+	wafMu.Lock()
+	defer wafMu.Unlock()
+	d := wafCooldownStep(base, max)
+	wafURLs[url] = time.Now().Add(d)
+	return d
+}
+
+// urlWAFBlocked reports whether a listing endpoint is still parked. Expired
+// entries are forgotten on the way past.
+func urlWAFBlocked(url string) bool {
+	wafMu.Lock()
+	defer wafMu.Unlock()
+	until, ok := wafURLs[url]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(wafURLs, url)
+		return false
+	}
+	return true
+}
+
+// wafSuccess clears the escalation after an API call that worked, so unrelated
+// blocks do not leave the mount backing off for half an hour.
+func wafSuccess() {
+	wafMu.Lock()
+	wafNext = 0
 	wafMu.Unlock()
 }
 
@@ -406,8 +497,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 
-	fs.Debugf(f, "115: qps=%g (min interval %v), api_timeout=%v, page_size=%d, list_cache_time=%v, download_cache_time=%v",
-		opt.QPS, qpsToInterval(opt.QPS), time.Duration(opt.APITimeout), opt.PageSize, time.Duration(opt.ListCacheTime), time.Duration(opt.DownloadCacheTime))
+	fs.Debugf(f, "115: qps=%g (min interval %v), api_timeout=%v, waf_cooldown=%v (max %v), page_size=%d, list_cache_time=%v, download_cache_time=%v",
+		opt.QPS, qpsToInterval(opt.QPS), time.Duration(opt.APITimeout), time.Duration(opt.WAFCooldown), time.Duration(opt.WAFCooldownMax), opt.PageSize, time.Duration(opt.ListCacheTime), time.Duration(opt.DownloadCacheTime))
 
 	// Resolve the root.  An empty root is the common mount case and costs no
 	// requests at all.
@@ -450,7 +541,11 @@ func (f *Fs) withAPI(ctx context.Context, fn func() error) error {
 		return err
 	}
 	defer apiExit()
-	return fn()
+	err := fn()
+	if err == nil {
+		wafSuccess()
+	}
+	return err
 }
 
 // absPath converts a path relative to the rclone root into an absolute path
@@ -468,20 +563,29 @@ func (f *Fs) absPath(remote string) string {
 }
 
 // orderedURLs returns the listing endpoints to try, with the last known good
-// one first.
+// one first and any endpoint still parked after its own WAF block left out.
+// An empty result means every endpoint is cooling down.
 func (f *Fs) orderedURLs() []string {
 	gcache.mu.Lock()
 	preferred := gcache.listURL
 	gcache.mu.Unlock()
 
-	urls := make([]string, 0, len(f.opt.ListAPIURLs)+1)
+	all := make([]string, 0, len(f.opt.ListAPIURLs)+1)
 	if preferred != "" {
-		urls = append(urls, preferred)
+		all = append(all, preferred)
 	}
 	for _, u := range f.opt.ListAPIURLs {
 		if u != preferred {
-			urls = append(urls, u)
+			all = append(all, u)
 		}
+	}
+
+	urls := make([]string, 0, len(all))
+	for _, u := range all {
+		if urlWAFBlocked(u) {
+			continue
+		}
+		urls = append(urls, u)
 	}
 	return urls
 }
@@ -503,9 +607,17 @@ func (f *Fs) listDir(ctx context.Context, cid, dirPath string) ([]driver.File, e
 
 	var all []driver.File
 	offset := int64(0)
-	urls := f.orderedURLs()
 
 	for {
+		urls := f.orderedURLs()
+		if len(urls) == 0 {
+			// Every listing endpoint is parked after its own WAF block, so fall
+			// back to the process wide cooldown: callers get one fast, uniform
+			// error instead of probing a blocked endpoint again.
+			d := markWAFBlocked(time.Duration(f.opt.WAFCooldown), time.Duration(f.opt.WAFCooldownMax))
+			return nil, fmt.Errorf("115: every listing endpoint is cooling down after a WAF block, next attempt in %s", d)
+		}
+
 		var resp *driver.FileListResp
 		var lastErr error
 		for _, u := range urls {
@@ -535,9 +647,10 @@ func (f *Fs) listDir(ctx context.Context, cid, dirPath string) ([]driver.File, e
 			lastErr = err
 			fs.Debugf(f, "115: listing via %s failed: %v", url, err)
 			if isWAFError(err) {
-				markWAFBlocked()
-				fs.Errorf(f, "115: WAF blocked listing via %s, cooling down for %s", url, wafCooldown)
-				break
+				// Park this endpoint only. The others may still be usable, which
+				// is the whole point of having more than one.
+				d := markURLBlocked(url, time.Duration(f.opt.WAFCooldown), time.Duration(f.opt.WAFCooldownMax))
+				fs.Errorf(f, "115: WAF blocked listing via %s, parking that endpoint for %s", url, d)
 			}
 		}
 		if lastErr != nil {
@@ -604,7 +717,7 @@ func (f *Fs) resolveDir(ctx context.Context, dir string) (string, error) {
 		return cid, nil
 	}
 	if isWAFError(err) {
-		markWAFBlocked()
+		markWAFBlocked(time.Duration(f.opt.WAFCooldown), time.Duration(f.opt.WAFCooldownMax))
 		return "", err
 	}
 
@@ -843,7 +956,7 @@ func (o *Object) fetchDownloadURL(ctx context.Context, ua string) (*driver.Downl
 	})
 	if err != nil {
 		if isWAFError(err) {
-			markWAFBlocked()
+			markWAFBlocked(time.Duration(o.fs.opt.WAFCooldown), time.Duration(o.fs.opt.WAFCooldownMax))
 		}
 		return nil, err
 	}
