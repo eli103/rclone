@@ -85,7 +85,48 @@ rclone-115 mount my115: /mnt/115 --read-only --allow-other \
 
 ### 开机自启（systemd）
 
-见 [`rclone-115.service.example`](rclone-115.service.example)。
+见 [`rclone-115.service.example`](rclone-115.service.example)。其中几项不是可有可无的：
+
+| 参数 | 为什么必须 |
+|---|---|
+| `--timeout 2m` | CDN 下载走 rclone 的 `fshttp`，它的空闲超时就是 `--timeout`（默认 5m）。卡住时进程要在不可中断睡眠里待满这个时间才拿到错误，调小能让 Plex 更快拿到 EIO 而不是干等 |
+| `--115-api-timeout 1m` | 115 API 请求的硬超时，防止被 WAF 拦住的请求无限挂起（后端默认值即 1m，写出来是为了显式可见） |
+| `--115-qps 2` | 115 API 请求速率上限（最低会被抬到 1.5），避免触发风控 |
+| `ExecStop=fusermount -uz` | **懒卸载**。挂载点卡死时 `fusermount -u` 会一直阻塞到 `TimeoutStopSec` 超时，让 unit 处于半死状态 |
+
+### 卡死自愈（看门狗，强烈建议）
+
+FUSE 内核驱动**没有请求超时**：后端没应答某个请求时，调用者会一直睡在
+`request_wait_answer()`（不可中断睡眠，连 `SIGKILL` 都无效），整个挂载点停止服务。
+**systemd 也救不了** —— 进程还活着，`Restart=on-failure` 根本不会触发，
+所以一次卡死可以持续好几天。
+
+[`rclone-115-watchdog.sh`](rclone-115-watchdog.sh) 轮询内核的每连接 `waiting` 计数，
+连续多次不为 0 就 `abort` 该 FUSE 连接（把卡住的任务以 EIO 释放）并重启挂载：
+
+```bash
+sudo install -m 755 rclone-115-watchdog.sh      /usr/local/bin/rclone-115-watchdog
+sudo install -m 644 rclone-115-watchdog.service /etc/systemd/system/
+sudo install -m 644 rclone-115-watchdog.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rclone-115-watchdog.timer
+```
+
+默认每分钟检查一次、连续 3 次命中才动手，即**卡死约 3 分钟内自动恢复**，
+并把现场（`waiting` 数、连接 id、rclone 进程、`dmesg` 尾部）记进 journal。
+
+### 另一个陷阱：core dump 写进 FUSE
+
+`kernel.core_pattern` 是**相对路径**（Debian 默认 `core`）时，内核会把 core 文件写到
+**崩溃进程的 cwd**。如果那个 cwd 落在 FUSE 挂载点上，coredump 的写操作本身就会卡住，
+并且 `PF_POSTCOREDUMP` 会让这些线程**不会被 `SIGKILL` 清理**，形成永久 D 状态。
+本 backend 只读，所以写 core 会 `EROFS` 快速失败，但**一旦启用写支持、或 cwd 落在
+别的可写 FUSE 上，这就是真死锁**。建议改成绝对路径：
+
+```ini
+# /etc/sysctl.d/99-coredump.conf
+kernel.core_pattern = /var/crash/core.%e.%p.%t
+```
 
 ## 限制与注意
 
@@ -98,6 +139,9 @@ rclone-115 mount my115: /mnt/115 --read-only --allow-other \
   ```
 - 走 115 的**私有 API（cookie）**，不是官方 Open API，存在被风控的可能。
   请勿高频调用，用 `qps` 控制请求速率（已设最小 1.5，防过慢）。
+- **FUSE 挂载点会卡死且不可自愈**：内核不给 FUSE 请求设超时，后端一旦不应答，
+  相关进程就永久停在不可中断睡眠，且 systemd 看不出来。**必须配看门狗**，
+  见上文《卡死自愈》。
 
 ## 设计说明
 

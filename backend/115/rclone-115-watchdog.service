@@ -1,0 +1,15 @@
+[Unit]
+Description=Watchdog for the rclone 115 FUSE mount
+Documentation=file:///usr/local/bin/rclone-115-watchdog
+After=rclone-115.service
+
+[Service]
+Type=oneshot
+# Root is required: the check reads /sys/fs/fuse/connections and the recovery
+# path writes to it and restarts the mount unit.
+ExecStart=/usr/local/bin/rclone-115-watchdog
+
+# Uncomment to tune the watchdog (see the header of rclone-115-watchdog.sh):
+#Environment=MOUNTPOINT=/mnt/115
+#Environment=UNIT=rclone-115
+#Environment=THRESHOLD=3

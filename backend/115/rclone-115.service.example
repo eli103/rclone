@@ -8,6 +8,9 @@
 # Notes:
 # - --allow-other requires `user_allow_other` in /etc/fuse.conf
 # - do NOT use --daemon here, systemd supervises the process
+# - systemd cannot recover a wedged mount: an unanswered FUSE request leaves the
+#   daemon alive, so Restart=on-failure never fires.  Install the watchdog too
+#   (rclone-115-watchdog.sh + .service + .timer).
 
 [Unit]
 Description=rclone mount 115 (read-only)
@@ -21,8 +24,16 @@ ExecStart=/usr/local/bin/rclone-115 mount my115: /mnt/115 \
   --read-only --allow-other \
   --vfs-read-chunk-size 4M --vfs-read-chunk-streams 2 \
   --buffer-size 32M --dir-cache-time 1h \
+  --timeout 2m \
+  --115-api-timeout 1m --115-qps 2 \
   --log-level INFO
-ExecStop=/bin/fusermount -u /mnt/115
+
+# Lazy unmount: with a wedged mount a plain `fusermount -u` blocks until
+# TimeoutStopSec expires and leaves the unit half-stopped.  -z detaches at once
+# and the kernel drops the connection when the daemon exits.
+ExecStop=/bin/fusermount -uz /mnt/115
+TimeoutStopSec=20
+
 Restart=on-failure
 RestartSec=10
 

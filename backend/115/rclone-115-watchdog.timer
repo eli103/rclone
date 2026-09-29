@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodically check the rclone 115 FUSE mount for unanswered requests
+
+[Timer]
+# First check shortly after boot, then once a minute.  With the default
+# THRESHOLD=3 that means a wedged mount is detected and recovered within about
+# three minutes.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+# A missed check (suspend, heavy load) must not queue a backlog of runs that
+# would inflate the consecutive-failure counter.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
